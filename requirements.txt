@@ -1,0 +1,26 @@
+# Core RAG framework
+llama-index-core
+
+# Ollama — local LLM + embeddings
+llama-index-llms-ollama
+llama-index-embeddings-ollama
+
+# Qdrant — vector store with hybrid search
+llama-index-vector-stores-qdrant
+qdrant-client[fastembed]
+
+# Reranker
+llama-index-postprocessor-sbert-rerank
+sentence-transformers
+
+# PDF parsing
+docling==2.84.0
+
+# Evaluation
+ragas
+datasets
+
+# API
+fastapi
+uvicorn
+httpx
