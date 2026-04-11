@@ -4,7 +4,7 @@ OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
 QDRANT_URL      = os.getenv("QDRANT_URL",      "http://localhost:6333")
 
 # Ollama
-OLLAMA_MODEL    = "llama3.2:3b"           # generation
+OLLAMA_MODEL    = "qwen2.5:1.5b"           # generation
 EMBED_MODEL     = "nomic-embed-text" # embeddings 
 EMBED_DIM       = 768
 
@@ -12,7 +12,7 @@ EMBED_DIM       = 768
 COLLECTION_NAME  = "rag_docs"
 
 # Chunking
-CHUNK_BREAKPOINT = 85 
+CHUNK_BREAKPOINT = 90 
 
 # Retrieval
 RETRIEVAL_TOP_K = 15  # candidates from hybrid search before reranking

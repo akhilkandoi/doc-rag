@@ -3,6 +3,7 @@ llama-index-core
 
 # Ollama — local LLM + embeddings
 llama-index-llms-ollama
+langchain_ollama
 llama-index-embeddings-ollama
 
 # Qdrant — vector store with hybrid search
@@ -17,7 +18,7 @@ sentence-transformers
 docling==2.84.0
 
 # Evaluation
-ragas
+deepeval
 datasets
 
 # API

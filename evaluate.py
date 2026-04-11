@@ -1,37 +1,41 @@
 # evaluation/evaluate.py
-# Measures your pipeline quality with 4 RAGAS metrics:
+# Measures your pipeline quality with 4 DeepEval RAG metrics:
 #
-#   Faithfulness      — is the answer grounded in the retrieved context?
-#                       low score = LLM is hallucinating
+#   Faithfulness          — is the answer grounded in the retrieved context?
+#                           low score = LLM is hallucinating
 #
-#   Answer Relevancy  — does the answer address the question?
-#                       low score = answer is off-topic or evasive
+#   Answer Relevancy      — does the answer address the question?
+#                           low score = answer is off-topic or evasive
 #
-#   Context Precision — are the retrieved chunks actually relevant?
-#                       low score = retrieval is noisy, lower RERANK_TOP_N
+#   Contextual Precision  — are the retrieved chunks actually relevant?
+#                           low score = retrieval is noisy, lower RERANK_TOP_N
 #
-#   Context Recall    — did retrieval find everything needed to answer?
-#                       low score = raise RETRIEVAL_TOP_K or lower CHUNK_BREAKPOINT
+#   Contextual Recall     — did retrieval find everything needed to answer?
+#                           low score = raise RETRIEVAL_TOP_K or lower CHUNK_BREAKPOINT
 #
 # HOW TO USE:
-#   1. Fill in TEST_CASES below with Q&A pairs from your actual documents
-#   2. Run: python evaluation/evaluate.py
-#   3. Scores printed to terminal + saved to evaluation/results.csv
+#   1. pip install deepeval
+#   2. Fill in TEST_CASES below with Q&A pairs from your actual documents
+#   3. Run: python evaluation/evaluate.py
+#   4. Scores printed to terminal + saved to evaluation/results.csv
 
 import sys, os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import csv
 from retriever import build_retriever, retrieve
 from generate import generate
 
-from datasets import Dataset
-from ragas import evaluate
-from ragas.metrics import Faithfulness, AnswerRelevancy, ContextPrecision, ContextRecall
-from ragas.llms import LangchainLLMWrapper
-from ragas.embeddings import LangchainEmbeddingsWrapper
-from langchain_community.llms import Ollama as LangchainOllama
-from langchain_community.embeddings import OllamaEmbeddings as LangchainOllamaEmbeddings
-from config import OLLAMA_BASE_URL, OLLAMA_MODEL, EMBED_MODEL
+from deepeval.models import OllamaModel
+from deepeval.metrics import (
+    FaithfulnessMetric,
+    AnswerRelevancyMetric,
+    ContextualPrecisionMetric,
+    ContextualRecallMetric,
+)
+from deepeval.test_case import LLMTestCase
+from deepeval import evaluate as deepeval_evaluate
+from config import OLLAMA_BASE_URL, OLLAMA_MODEL
 
 # ================================================================
 # FILL THESE IN — use questions answerable from your actual PDFs
@@ -141,18 +145,39 @@ TEST_CASES = [
 ]
 # ================================================================
 
+# Score threshold — a test case is considered "passing" at or above this value.
+# DeepEval defaults to 0.5; raise to 0.7+ for stricter evaluation.
+THRESHOLD = 0.5
+
+
+def fmt(val):
+    return f"{val:.3f}" if val is not None else "N/A"
+
 
 def run_evaluation():
+    # --- Judge model (Ollama, no API key needed) ---
+    # Strip trailing /v1 from OLLAMA_BASE_URL if present — OllamaModel wants the bare host.
+    ollama_base = OLLAMA_BASE_URL.rstrip("/").removesuffix("/v1")
+    judge = OllamaModel(
+        model=OLLAMA_MODEL,     # e.g. "qwen2.5:1.5b"
+        base_url=ollama_base,   # e.g. "http://localhost:11434"
+        temperature=0,          # deterministic scoring
+        timeout=300,            # 5 min per call — prevents TimeoutError on slow hardware
+    )
+
+    # --- Metrics ---
+    metrics = [
+        FaithfulnessMetric(threshold=THRESHOLD, model=judge, include_reason=True),
+        AnswerRelevancyMetric(threshold=THRESHOLD, model=judge, include_reason=True),
+        ContextualPrecisionMetric(threshold=THRESHOLD, model=judge, include_reason=True),
+        ContextualRecallMetric(threshold=THRESHOLD, model=judge, include_reason=True),
+    ]
+
     print("Building retriever...")
     retriever = build_retriever()
 
     print(f"\nRunning {len(TEST_CASES)} test cases...\n")
-    eval_data = {
-        "question": [],
-        "answer": [],
-        "contexts": [],
-        "ground_truth": []
-    }
+    test_cases = []
 
     for i, tc in enumerate(TEST_CASES):
         print(f"[{i+1}/{len(TEST_CASES)}] {tc['question'][:70]}...")
@@ -160,56 +185,87 @@ def run_evaluation():
             chunks = retrieve(tc["question"], retriever)
             result = generate(tc["question"], chunks)
 
-            eval_data["question"].append(tc["question"])
-            eval_data["answer"].append(result["answer"])
-            eval_data["contexts"].append(result["contexts"])
-            eval_data["ground_truth"].append(tc["ground_truth"])
+            test_cases.append(LLMTestCase(
+                input=tc["question"],
+                actual_output=result["answer"],
+                retrieval_context=result["contexts"],  # list[str]
+                expected_output=tc["ground_truth"],    # needed for Recall & Precision
+            ))
         except Exception as e:
             print(f"  Error: {e} — skipping this question")
 
-    if not eval_data["question"]:
+    if not test_cases:
         print("No results to evaluate. Check your pipeline.")
         return
 
-    print("\nRunning RAGAS scoring (uses Ollama as judge — takes a few minutes)...")
+    print(f"\nRunning DeepEval scoring with Ollama judge ({OLLAMA_MODEL})...\n")
+    print("Evaluating one test case at a time to avoid overwhelming Ollama with")
+    print("parallel requests (which causes the TimeoutError you saw before).\n")
 
-    # RAGAS needs LangChain-wrapped versions of the models
-    judge_llm = LangchainLLMWrapper(
-        LangchainOllama(base_url=OLLAMA_BASE_URL, model=OLLAMA_MODEL)
-    )
-    judge_embeddings = LangchainEmbeddingsWrapper(
-        LangchainOllamaEmbeddings(base_url=OLLAMA_BASE_URL, model=EMBED_MODEL)
-    )
+    # We evaluate each test case individually rather than passing all at once.
+    # deepeval's default runs metrics concurrently via asyncio.gather — Ollama
+    # can only handle one request at a time, so parallel calls pile up and time out.
+    # Looping one-by-one is the most version-compatible fix (no kwargs needed).
+    metric_names = ["faithfulness", "answer_relevancy", "contextual_precision", "contextual_recall"]
+    aggregated = {name: [] for name in metric_names}
+    all_test_results = []
 
-    scores = evaluate(
-        Dataset.from_dict(eval_data),
-        metrics=[Faithfulness(), AnswerRelevancy(), ContextPrecision(), ContextRecall()],
-        llm=judge_llm,
-        embeddings=judge_embeddings
-    )
+    for i, tc in enumerate(test_cases):
+        print(f"  Scoring [{i+1}/{len(test_cases)}] {tc.input[:65]}...")
+        try:
+            result = deepeval_evaluate([tc], metrics)
+            all_test_results.append(result.test_results[0])
+            for m in result.test_results[0].metrics_data:
+                key = m.name.lower().replace(" ", "_")
+                if key in aggregated and m.score is not None:
+                    aggregated[key].append(m.score)
+        except Exception as e:
+            print(f"    Scoring error: {e} — skipping")
 
-    # Print results
+    def avg(scores):
+        return sum(scores) / len(scores) if scores else None
+
+    faithfulness     = avg(aggregated["faithfulness"])
+    answer_relevancy = avg(aggregated["answer_relevancy"])
+    ctx_precision    = avg(aggregated["contextual_precision"])
+    ctx_recall       = avg(aggregated["contextual_recall"])
+
     print("\n" + "=" * 55)
-    print("RAGAS SCORES")
+    print("DEEPEVAL SCORES")
     print("=" * 55)
-    print(f"  Faithfulness:      {scores['faithfulness']:.3f}")
-    print(f"  Answer Relevancy:  {scores['answer_relevancy']:.3f}")
-    print(f"  Context Precision: {scores['context_precision']:.3f}")
-    print(f"  Context Recall:    {scores['context_recall']:.3f}")
+    print(f"  Faithfulness:          {fmt(faithfulness)}")
+    print(f"  Answer Relevancy:      {fmt(answer_relevancy)}")
+    print(f"  Contextual Precision:  {fmt(ctx_precision)}")
+    print(f"  Contextual Recall:     {fmt(ctx_recall)}")
     print("=" * 55)
-    print("  Target: > 0.75 solid  |  > 0.85 interview-worthy")
+    print("  Target: > 0.75 solid")
     print()
-    print("  Low Faithfulness?      → tighten the prompt in generation/generate.py")
-    print("  Low Answer Relevancy?  → LLM going off-topic, try a stronger model")
-    print("  Low Context Precision? → too much noise, lower RERANK_TOP_N in config.py")
-    print("  Low Context Recall?    → raise RETRIEVAL_TOP_K or lower CHUNK_BREAKPOINT")
+    print("  Low Faithfulness?         → tighten the prompt in generate.py")
+    print("  Low Answer Relevancy?     → LLM going off-topic, try a stronger model")
+    print("  Low Contextual Precision? → too much noise, lower RERANK_TOP_N in config.py")
+    print("  Low Contextual Recall?    → raise RETRIEVAL_TOP_K or lower CHUNK_BREAKPOINT")
     print("=" * 55)
 
-    # Save per-question breakdown
+    # --- Save per-question breakdown to CSV ---
     os.makedirs("evaluation", exist_ok=True)
-    df = scores.to_pandas()
-    df.to_csv("evaluation/results.csv", index=False)
-    print("\nPer-question breakdown saved to evaluation/results.csv")
+    csv_path = "evaluation/results.csv"
+    with open(csv_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(["question", "answer", "faithfulness", "answer_relevancy",
+                         "contextual_precision", "contextual_recall"])
+        for tc_obj, tc_result in zip(test_cases, all_test_results):
+            row_scores = {m.name.lower().replace(" ", "_"): m.score
+                          for m in tc_result.metrics_data}
+            writer.writerow([
+                tc_obj.input,
+                tc_obj.actual_output,
+                row_scores.get("faithfulness"),
+                row_scores.get("answer_relevancy"),
+                row_scores.get("contextual_precision"),
+                row_scores.get("contextual_recall"),
+            ])
+
+    print(f"\nPer-question breakdown saved to {csv_path}")
 
 
 if __name__ == "__main__":
